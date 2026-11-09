@@ -1,0 +1,14 @@
+{
+  "features": {
+  },
+  "postCreateCommand": "npm run bootstrap",
+  "customizations": {
+    "codespaces": {
+      "repositories": {
+        "diplodoc-platform/*": {
+          "permissions": "write-all"
+        }
+      }
+    }
+  }
+}

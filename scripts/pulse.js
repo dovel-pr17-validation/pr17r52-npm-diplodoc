@@ -1,0 +1,250 @@
+#!/usr/bin/env node
+/**
+ * Generates PULSE.md — status of metapackage submodules (badges for tests, release, security, coverage, lint)
+ * and a Mermaid dependency graph of @diplodoc/* packages.
+ * Run from repo root: node scripts/pulse.js [> PULSE.md]
+ *
+ * Table columns vary by section: packages/extensions include coverage and lint; devops has lint, no coverage;
+ * actions have no tests/lint. The "lint" column uses shields.io Dynamic JSON badge to show @diplodoc/lint
+ * version from each repo's package-lock.json. Override any cell with '-' via row config.
+ * At the end, a Mermaid flowchart is appended from deps-graph.json (@diplodoc/* package.json edges).
+ * In Mermaid, "flowchart" is the right type for directed dependency graphs (nodes + arrows); orientation TB = top-to-bottom.
+ */
+
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { buildDepsGraph, renderMermaid, shortId } from './deps-graph.js';
+
+const ORG = 'diplodoc-platform';
+const BRANCH = 'master';
+
+/** JSONPath for @diplodoc/lint version in package-lock.json (npm lockfile v3) */
+const LINT_VERSION_QUERY = "$['packages']['node_modules/@diplodoc/infra'].version";
+
+/** Short ids hidden from the Mermaid graph (infra tooling — everyone depends on them). */
+const DEPENDS_GRAPH_HIDE = new Set(['infra', 'package-template']);
+
+/** Exclude example/demo packages from the graph (shortId ending with -example). */
+const DEPENDS_GRAPH_HIDE_EXAMPLE = true;
+
+const SECTIONS = {
+  packages: {
+    columns: ['version', 'tests', 'release', 'security', 'coverage', 'infra'],
+    versionBadge: 'npm',
+    rows: [
+      { path: 'packages/cli', repo: 'cli', npm: '@diplodoc/cli', coverage: 'sonar' },
+      { path: 'packages/client', repo: 'client', npm: '@diplodoc/client' },
+      { path: 'packages/components', repo: 'components', npm: '@diplodoc/components' },
+      { path: 'packages/directive', repo: 'directive', npm: '@diplodoc/directive', coverage: 'sonar' },
+      { path: 'packages/liquid', repo: 'liquid', npm: '@diplodoc/liquid', coverage: 'sonar' },
+      { path: 'packages/sentenizer', repo: 'sentenizer', npm: '@diplodoc/sentenizer', coverage: 'sonar' },
+      { path: 'packages/transform', repo: 'transform', npm: '@diplodoc/transform', coverage: 'sonar' },
+      { path: 'packages/translation', repo: 'translation', npm: '@diplodoc/translation', coverage: 'sonar' },
+      { path: 'packages/utils', repo: 'utils', npm: '@diplodoc/utils', coverage: 'sonar' },
+      { path: 'packages/ajv', repo: 'ajv', npm: '@diplodoc/ajv', coverage: 'sonar' },
+      { path: 'packages/vsc', repo: 'vsc', npm: '@diplodoc/vsc', coverage: 'sonar' },
+      { path: 'packages/yfmlint', repo: 'yfmlint', npm: '@diplodoc/yfmlint', coverage: 'sonar' },
+    ],
+  },
+  extensions: {
+    columns: ['version', 'tests', 'release', 'security', 'coverage', 'infra'],
+    versionBadge: 'npm',
+    rows: [
+      { path: 'extensions/algolia', repo: 'algolia-extension', npm: '@diplodoc/algolia-extension', coverage: 'sonar' },
+      { path: 'extensions/color', repo: 'color-extension', npm: '@diplodoc/color-extension', coverage: 'sonar' },
+      { path: 'extensions/cut', repo: 'cut-extension', npm: '@diplodoc/cut-extension', coverage: 'sonar' },
+      { path: 'extensions/file', repo: 'file-extension', npm: '@diplodoc/file-extension', coverage: 'sonar' },
+      { path: 'extensions/folding-headings', repo: 'folding-headings-extension', npm: '@diplodoc/folding-headings-extension', coverage: 'sonar' },
+      { path: 'extensions/html', repo: 'html-extension', npm: '@diplodoc/html-extension', coverage: 'sonar' },
+      { path: 'extensions/latex', repo: 'latex-extension', npm: '@diplodoc/latex-extension', coverage: 'sonar' },
+      { path: 'extensions/mermaid', repo: 'mermaid-extension', npm: '@diplodoc/mermaid-extension', coverage: 'sonar' },
+      { path: 'extensions/openapi', repo: 'openapi-extension', npm: '@diplodoc/openapi-extension', coverage: 'sonar' },
+      { path: 'extensions/page-constructor', repo: 'page-constructor-extension', npm: '@diplodoc/page-constructor-extension', coverage: 'sonar' },
+      { path: 'extensions/quote-link', repo: 'quote-link-extension', npm: '@diplodoc/quote-link-extension', coverage: 'sonar' },
+      { path: 'extensions/search', repo: 'search-extension', npm: '@diplodoc/search-extension', coverage: 'sonar' },
+      { path: 'extensions/tabs', repo: 'tabs-extension', npm: '@diplodoc/tabs-extension', coverage: 'sonar' },
+    ],
+  },
+  devops: {
+    columns: ['version', 'tests', 'release', 'security'],
+    versionBadge: 'npm',
+    rows: [
+      { path: 'devops/infra', repo: 'infra', npm: '@diplodoc/infra', lint: '-' },
+      { path: 'devops/package-template', repo: 'package-template', version: '-', tests: '-', release: '-' },
+      { path: 'devops/testpack', repo: 'testpack', npm: '@diplodoc/testpack' },
+    ],
+  },
+  actions: {
+    columns: ['version', 'release', 'security'],
+    versionBadge: 'github-release',
+    rows: [
+      { path: 'actions/docs-build', repo: 'docs-build-action' },
+      { path: 'actions/docs-build-static', repo: 'docs-build-static-action' },
+      { path: 'actions/docs-clean', repo: 'docs-clean-action' },
+      { path: 'actions/docs-message', repo: 'docs-message-action' },
+      { path: 'actions/docs-release', repo: 'docs-release-action' },
+      { path: 'actions/docs-upload', repo: 'docs-upload-action' },
+      { path: 'actions/setup-node', repo: 'setup-node-action' },
+    ],
+  },
+};
+
+function link(href, text) {
+  return `[${text}](${href})`;
+}
+
+function badge(imgUrl, linkUrl, alt = 'badge') {
+  return link(linkUrl, `![${alt}](${imgUrl})`);
+}
+
+function cell(row, col, sectionConfig) {
+  const override = row[col];
+  if (override === '-') return '-';
+
+  const repo = row.repo;
+  const base = `https://github.com/${ORG}/${repo}`;
+
+  switch (col) {
+    case 'version': {
+      if (sectionConfig.versionBadge === 'github-release') {
+        return badge(
+          `https://img.shields.io/github/v/release/${ORG}/${repo}`,
+          `${base}/releases`,
+          'version'
+        );
+      }
+      const npmName = row.npm;
+      if (!npmName) return '-';
+      return badge(
+        `https://img.shields.io/npm/v/${npmName}`,
+        `${base}/releases`,
+        'version'
+      );
+    }
+    case 'tests':
+      return badge(
+        `https://github.com/${ORG}/${repo}/actions/workflows/tests.yml/badge.svg?branch=${BRANCH}`,
+        `https://github.com/${ORG}/${repo}/actions/workflows/tests.yml`,
+        'tests'
+      );
+    case 'release':
+      return badge(
+        `https://github.com/${ORG}/${repo}/actions/workflows/release.yml/badge.svg?event=release`,
+        `https://github.com/${ORG}/${repo}/actions/workflows/release.yml`,
+        'release'
+      );
+    case 'security':
+      return badge(
+        `https://github.com/${ORG}/${repo}/actions/workflows/security.yml/badge.svg?branch=${BRANCH}`,
+        `https://github.com/${ORG}/${repo}/actions/workflows/security.yml`,
+        'security'
+      );
+    case 'coverage': {
+      if (row.coverage === 'sonar') {
+        return badge(
+          `https://sonarcloud.io/api/project_badges/measure?project=${ORG}_${repo}&metric=coverage`,
+          `https://sonarcloud.io/summary/overall?id=${ORG}_${repo}`,
+          'Coverage'
+        );
+      }
+      return '-';
+    }
+    case 'infra': {
+      const lockUrl = `https://raw.githubusercontent.com/${ORG}/${repo}/${BRANCH}/package-lock.json`;
+      const params = new URLSearchParams({
+        url: lockUrl,
+        query: LINT_VERSION_QUERY,
+        label: 'infra',
+        prefix: 'v',
+      });
+      const imgUrl = `https://img.shields.io/badge/dynamic/json?${params.toString()}`;
+      return badge(imgUrl, `https://github.com/${ORG}/lint/releases`, 'lint');
+    }
+    default:
+      return '-';
+  }
+}
+
+function tableHeader(columns) {
+  const heads = ['Submodule', ...columns];
+  const sep = heads.map((_, i) => (i === 0 ? '-----------' : ':-------:'));
+  return ['| ' + heads.join(' | ') + ' |', '|' + sep.join('|') + '|'].join('\n');
+}
+
+function tableRow(row, columns, sectionConfig) {
+  const linkText = link(`https://github.com/${ORG}/${row.repo}`, row.path);
+  const cells = [linkText, ...columns.map((col) => cell(row, col, sectionConfig))];
+  return '| ' + cells.join(' | ') + ' |';
+}
+
+function renderSection(name, sectionConfig, isLast = false) {
+  const lines = [`## ${name}`, '', tableHeader(sectionConfig.columns)];
+  for (const row of sectionConfig.rows) {
+    lines.push(tableRow(row, sectionConfig.columns, sectionConfig));
+  }
+  if (!isLast) {
+    lines.push('---', '');
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Build Mermaid diagram from deps-graph.json (@diplodoc/* package.json edges).
+ * Excludes packages in DEPENDS_GRAPH_HIDE. Prod: solid (-->), dev: dotted (-.->).
+ */
+function renderDepsGraph() {
+  let graph;
+  try {
+    graph = buildDepsGraph();
+  } catch {
+    return '';
+  }
+
+  const filteredEdges = graph.edges.filter((e) => {
+    if (DEPENDS_GRAPH_HIDE.has(e.fromShort) || DEPENDS_GRAPH_HIDE.has(e.toShort)) return false;
+    if (DEPENDS_GRAPH_HIDE_EXAMPLE && (e.fromShort.endsWith('-example') || e.toShort.endsWith('-example'))) {
+      return false;
+    }
+    return true;
+  });
+
+  if (filteredEdges.length === 0) return '';
+
+  const mermaidBody = renderMermaid({ ...graph, edges: filteredEdges }, { org: ORG });
+
+  const hideParts = [...DEPENDS_GRAPH_HIDE].sort();
+  if (DEPENDS_GRAPH_HIDE_EXAMPLE) hideParts.push('*-example');
+
+  return [
+    '## Dependency graph (@diplodoc packages)',
+    '',
+    'Generated from `package.json` dependencies (`scripts/deps-graph.js` → `deps-graph.json`). **Orientation:** left to right (`flowchart LR`).',
+    '',
+    '```mermaid',
+    mermaidBody,
+    '```',
+    '',
+  ].join('\n');
+}
+
+const header = `# Pulse — status of submodules (master)
+
+Status badges for workflows created from [@diplodoc/infra](devops/infra) scaffolding (\`lint init\` / \`lint update\`).  
+Branch: **master**. Release badge reflects the last \`release: published\` run (not \`workflow_dispatch\` on \`master\`).
+
+Workflows: [tests](.github/workflows/tests.yml) · [release](.github/workflows/release.yml) · [security](.github/workflows/security.yml)
+
+**Version:** npm latest for packages/extensions/devops (link → GitHub Releases); GitHub release for actions.
+
+---
+`;
+
+const sectionNames = Object.keys(SECTIONS);
+const body = sectionNames
+  .map((name, i) => renderSection(name, SECTIONS[name], i === sectionNames.length - 1))
+  .join('\n');
+
+const depsGraph = renderDepsGraph();
+const out = header + '\n' + body.trimEnd() + (depsGraph ? '\n\n---\n\n' + depsGraph : '') + '\n';
+
+writeFileSync(join(process.cwd(), 'PULSE.md'), out, 'utf8');
